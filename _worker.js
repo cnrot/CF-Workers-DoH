@@ -54,7 +54,7 @@ export default {
         }
       }
 
-      const ip = url.searchParams.get('ip') || request.headers.get('x-forwarded-for');
+      const ip = url.searchParams.get('ip') || request.headers.get('CF-Connecting-IP');
       if (!ip) {
         return new Response(JSON.stringify({ 
           status: "error",
