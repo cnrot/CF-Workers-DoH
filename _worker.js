@@ -1,6 +1,11 @@
 let DoH = "cloudflare-dns.com";
 const jsonDoH = `https://${DoH}/resolve`;
 const dnsDoH = `https://${DoH}/dns-query`;
+// 备用上游列表，主上游挂了时自动轮换
+const FALLBACK_DOH = [
+  { json: "https://dns.google/resolve",          dns: "https://dns.google/dns-query" },
+  { json: "https://dns.adguard-dns.com/resolve", dns: "https://dns.adguard-dns.com/dns-query" },
+];
 let DoH路径 = 'dns-query';
 export default {
   async fetch(request, env) {
@@ -392,7 +397,7 @@ async function handleLocalDohRequest(domain, type, hostname) {
   }
 }
 
-// DoH 请求处理函数
+// DoH 请求处理函数（带多上游 fallback）
 async function DOHRequest(request) {
   const { method, headers, body } = request;
   const UA = headers.get('User-Agent') || 'DoH Client';
@@ -402,90 +407,74 @@ async function DOHRequest(request) {
   try {
     // 直接访问端点的处理
     if (method === 'GET' && !url.search) {
-      // 如果是直接访问或浏览器访问，返回友好信息
       return new Response('Bad Request', {
         status: 400,
-        headers: {
-          'Content-Type': 'text/plain; charset=utf-8',
-          'Access-Control-Allow-Origin': '*'
-        }
+        headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*' }
       });
     }
 
-    // 根据请求方法和参数构建转发请求
-    let response;
-
+    // 构建所有上游列表：主上游 + 备用上游
+    const upstreams = [];
     if (method === 'GET' && searchParams.has('name')) {
       const searchDoH = searchParams.has('type') ? url.search : url.search + '&type=A';
-      // 处理 JSON 格式的 DoH 请求
-      response = await fetch(dnsDoH + searchDoH, {
-        headers: {
-          'Accept': 'application/dns-json',
-          'User-Agent': UA
-        }
-      });
-      // 如果 DoHUrl 请求非成功（状态码 200），则再请求 jsonDoH
-      if (!response.ok) response = await fetch(jsonDoH + searchDoH, {
-        headers: {
-          'Accept': 'application/dns-json',
-          'User-Agent': UA
-        }
-      });
+      upstreams.push(
+        { url: dnsDoH + searchDoH, headers: { 'Accept': 'application/dns-json', 'User-Agent': UA } },
+        { url: jsonDoH + searchDoH, headers: { 'Accept': 'application/dns-json', 'User-Agent': UA } },
+      );
+      // 添加备用上游
+      for (const fb of FALLBACK_DOH) {
+        upstreams.push({ url: fb.json + searchDoH, headers: { 'Accept': 'application/dns-json', 'User-Agent': UA } });
+      }
     } else if (method === 'GET') {
-      // 处理 base64url 格式的 GET 请求
-      response = await fetch(dnsDoH + url.search, {
-        headers: {
-          'Accept': 'application/dns-message',
-          'User-Agent': UA
-        }
-      });
+      upstreams.push(
+        { url: dnsDoH + url.search, headers: { 'Accept': 'application/dns-message', 'User-Agent': UA } },
+      );
+      for (const fb of FALLBACK_DOH) {
+        upstreams.push({ url: fb.dns + url.search, headers: { 'Accept': 'application/dns-message', 'User-Agent': UA } });
+      }
     } else if (method === 'POST') {
-      // 处理 POST 请求
-      response = await fetch(dnsDoH, {
-        method: 'POST',
-        headers: {
-          'Accept': 'application/dns-message',
-          'Content-Type': 'application/dns-message',
-          'User-Agent': UA
-        },
-        body: body
-      });
-
+      upstreams.push(
+        { url: dnsDoH, headers: { 'Accept': 'application/dns-message', 'Content-Type': 'application/dns-message', 'User-Agent': UA }, body },
+      );
+      for (const fb of FALLBACK_DOH) {
+        upstreams.push({ url: fb.dns, headers: { 'Accept': 'application/dns-message', 'Content-Type': 'application/dns-message', 'User-Agent': UA }, body });
+      }
     } else {
-      // 其他不支持的请求方式
       return new Response('不支持的请求格式: DoH请求需要包含name或dns参数，或使用POST方法', {
         status: 400,
-        headers: {
-          'Content-Type': 'text/plain; charset=utf-8',
-          'Access-Control-Allow-Origin': '*'
-        }
+        headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*' }
       });
     }
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`DoH 返回错误 (${response.status}): ${errorText.substring(0, 200)}`);
+    // 轮询上游，直到有一个成功
+    let lastError = null;
+    for (const up of upstreams) {
+      try {
+        const opts = { method: up.body ? 'POST' : 'GET', headers: up.headers };
+        if (up.body) opts.body = up.body;
+        const resp = await fetch(up.url, opts);
+        if (resp.ok) {
+          const responseHeaders = new Headers(resp.headers);
+          responseHeaders.set('Access-Control-Allow-Origin', '*');
+          responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+          responseHeaders.set('Access-Control-Allow-Headers', '*');
+          if (method === 'GET' && searchParams.has('name')) {
+            responseHeaders.set('Content-Type', 'application/json');
+          }
+          return new Response(resp.body, {
+            status: resp.status,
+            statusText: resp.statusText,
+            headers: responseHeaders
+          });
+        }
+        lastError = new Error(`上游 ${new URL(up.url).hostname} 返回 (${resp.status})`);
+      } catch (e) {
+        lastError = e;
+      }
     }
 
-    // 创建一个新的响应头对象
-    const responseHeaders = new Headers(response.headers);
-    // 设置跨域资源共享 (CORS) 的头部信息
-    responseHeaders.set('Access-Control-Allow-Origin', '*');
-    responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    responseHeaders.set('Access-Control-Allow-Headers', '*');
-    
-    // 检查是否为JSON格式的DoH请求，确保设置正确的Content-Type
-    if (method === 'GET' && searchParams.has('name')) {
-      // 对于JSON格式的DoH请求，明确设置Content-Type为application/json
-      responseHeaders.set('Content-Type', 'application/json');
-    }
-
-    // 返回响应
-    return new Response(response.body, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: responseHeaders
-    });
+    // 所有上游都失败
+    throw lastError || new Error("所有上游 DNS 服务均不可用");
   } catch (error) {
     console.error("DoH 请求处理错误:", error);
     return new Response(JSON.stringify({
@@ -493,10 +482,7 @@ async function DOHRequest(request) {
       stack: error.stack
     }, null, 4), {
       status: 500,
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*'
-      }
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
     });
   }
 }
